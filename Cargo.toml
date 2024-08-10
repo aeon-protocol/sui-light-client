@@ -1,0 +1,73 @@
+[package]
+name = "sui-light-client"
+version = "0.0.0"
+authors = ["Mysten Labs <build@mystenlabs.com>"]
+license = "BSD-3-Clause-Clear"
+publish = false
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.71"
+async-trait = "0.1.61"
+bcs = "0.1.4"
+bytes = "1.4.0"
+clap = { version = "4.4", features = ["derive", "wrap_help"] }
+move-core-types = { git = "https://github.com/MystenLabs/sui", package = "move-core-types", rev="c79f53f" }
+serde = { version = "1.0.144", features = ["derive", "rc"] }
+tokio = { version = "1.28.1", features = ["full"] }
+serde_yaml = "0.8.26"
+serde_json = { version = "1.0.95", features = [
+  "preserve_order",
+  "arbitrary_precision",
+] }
+sui-types = { git = "https://github.com/MystenLabs/sui", package = "sui-types",rev="c79f53f" }
+sui-config = { git = "https://github.com/MystenLabs/sui", package = "sui-config",rev="c79f53f" }
+sui-rest-api = { git = "https://github.com/MystenLabs/sui", package = "sui-rest-api",rev="c79f53f" }
+sui-json = { git = "https://github.com/MystenLabs/sui", package = "sui-json",rev="c79f53f" }
+sui-sdk = { git = "https://github.com/MystenLabs/sui", package = "sui-sdk" ,rev="c79f53f"}
+sui-keys = { git = "https://github.com/MystenLabs/sui", package = "sui-keys",rev="c79f53f" }
+shared-crypto = { git = "https://github.com/MystenLabs/sui", package = "shared-crypto" ,rev="c79f53f"}
+
+move-binary-format = { git = "https://github.com/MystenLabs/sui", package = "move-binary-format",rev="c79f53f" }
+sui-json-rpc-types = { git = "https://github.com/MystenLabs/sui", package = "sui-json-rpc-types",rev="c79f53f" }
+sui-package-resolver = { git = "https://github.com/MystenLabs/sui", package = "sui-package-resolver",rev="c79f53f" }
+
+
+axum = { version = "0.6.6", default-features = false, features = [
+  "headers",
+  "tokio",
+  "http1",
+  "http2",
+  "json",
+  "matched-path",
+  "original-uri",
+  "form",
+  "query",
+  "ws",
+] }
+tracing-subscriber = { version = "0.3.15", default-features = false, features = [
+  "std",
+  "smallvec",
+  "fmt",
+  "ansi",
+  "time",
+  "json",
+  "registry",
+  "env-filter",
+] }
+tracing = "0.1.37"
+
+object_store = { version = "0.10", features = ["aws", "gcp", "azure", "http"] }
+sui-data-ingestion-core = { git = "https://github.com/MystenLabs/sui", package = "sui-data-ingestion-core",rev="c79f53f" }
+backoff = { version = "0.4.0", features = ["tokio"] }
+
+sui-storage = { git = "https://github.com/MystenLabs/sui", package = "sui-storage",rev="c79f53f"}
+
+
+[[bin]]
+name = "light-client"
+path = "src/light-client/light-client.rs"
+
+[[bin]]
+name = "light-client-service"
+path = "src/service/service.rs"
