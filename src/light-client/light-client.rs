@@ -467,7 +467,11 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
                 .get_coins(sender, None, None, None)
                 .await
                 .unwrap();
-            let coin_gas = coins.data.into_iter().next().unwrap();
+            let coin_gas = coins
+                .data
+                .into_iter()
+                .max_by_key(|coin| coin.balance)
+                .unwrap();
 
             let tx_data = TransactionData::new_programmable(
                 sender,
