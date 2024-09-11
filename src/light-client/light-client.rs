@@ -39,7 +39,7 @@ use sui_config::genesis::Genesis;
 use sui_json::SuiJsonValue;
 use sui_package_resolver::Result as ResolverResult;
 use sui_package_resolver::{Package, PackageStore, Resolver};
-use sui_sdk::SuiClientBuilder;
+use sui_sdk::{SuiClientBuilder, SuiClient};
 
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
@@ -65,6 +65,28 @@ use sui_sdk::{
 };
 use sui_types::dynamic_field::DynamicFieldName;
 
+use shared_crypto::intent::{IntentMessage};
+
+use reqwest::header::{HeaderMap, AUTHORIZATION};
+use fastcrypto::encoding::Base64;
+// use anyhow::Result;
+// use reqwest::header::{HeaderMap, AUTHORIZATION};
+use reqwest::Client as RClient;
+// use serde::{Deserialize, Serialize};
+use std::env;
+// use sui_types::base_types::{SuiAddress, ObjectRef};
+use sui_types::crypto::{SuiKeyPair, Signature};
+// use sui_types::messages::{TransactionData, TransactionKind};
+// use sui_types::intent::{Intent, IntentMessage};
+use sui_json_rpc_types::SuiTransactionBlockResponse;
+
+use sui_types::transaction::{TransactionKind};
+use std::{collections::HashMap, sync::Mutex};
+// use log::info;
+
+
+
+
 /// A light client for the Sui blockchain
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -78,13 +100,15 @@ struct Args {
 }
 
 struct RemotePackageStore {
-    client: Client,
     config: Config,
+    cache: Mutex<HashMap<AccountAddress, Arc<Package>>>,
 }
-
 impl RemotePackageStore {
-    pub fn new(client: Client, config: Config) -> Self {
-        Self { client, config }
+    pub fn new(config: Config) -> Self {
+        Self {
+            config,
+            cache: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -93,11 +117,21 @@ impl PackageStore for RemotePackageStore {
     /// Read package contents. Fails if `id` is not an object, not a package, or is malformed in
     /// some way.
     async fn fetch(&self, id: AccountAddress) -> ResolverResult<Arc<Package>> {
-        let object = get_verified_object(&self.config, id.into())
-            .await
-            .expect("verified obj");
-        let package = Package::read_from_object(&object).unwrap();
-        Ok(Arc::new(package))
+        // Check if we have it in the cache
+        if let Some(package) = self.cache.lock().unwrap().get(&id) {
+            // info!("Fetch Package: {} cache hit", id);
+            return Ok(package.clone());
+        }
+
+        // info!("Fetch Package: {}", id);
+
+        let object = get_verified_object(&self.config, id.into()).await.unwrap();
+        let package = Arc::new(Package::read_from_object(&object).unwrap());
+
+        // Add to the cache
+        self.cache.lock().unwrap().insert(id, package.clone());
+
+        Ok(package)
     }
 }
 
@@ -119,6 +153,7 @@ enum SCommands {
     },
 }
 
+
 // The config file for the light client including the root of trust genesis digest
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct Config {
@@ -132,6 +167,12 @@ struct Config {
 
     //  Genesis file name
     genesis_filename: PathBuf,
+
+    /// Object store url
+    object_store_url: String,
+
+    /// GraphQL endpoint
+    graphql_url: String,
 
     sui_deployed_state_proof_package: String,
 
@@ -149,6 +190,43 @@ impl Config {
         format!("{}", self.dwallet_full_node_url)
     }
 }
+
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ReserveGasRequest {
+    pub gas_budget: u64,
+    pub reserve_duration_secs: u64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ReserveGasResponse {
+    pub result: Option<ReserveGasResult>,
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ReserveGasResult {
+    pub sponsor_address: SuiAddress,  // Adjust this as per your actual type
+    pub reservation_id: u64,      // Adjust this as per your actual type
+    pub gas_coins: Vec<ObjectRef>, // Adjust this as per your actual type
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ExecuteTxRequest {
+    pub reservation_id: u64,
+    pub tx_bytes: Base64,
+    pub user_sig: Base64,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+pub struct ExecuteTxResponse {
+    pub response: Option<SuiTransactionBlockResponse>,
+    pub error: Option<String>,
+}
+
+
+
+
 
 // The list of checkpoints at the end of each epoch
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -379,6 +457,12 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
         summary.clone().try_into_verified(&prev_committee)?;
         println!("verified checkpoint");
 
+        println!(
+            "Verifying to submit. Last: {} Epoch curr: {}",
+            latest_registered_epoch_committee_id,
+            summary.epoch()
+        );
+
         // Check if the checkpoint needs to be submitted to the dwallet network
         if (latest_registered_epoch_committee_id < summary.epoch()) {
             let mut ptb = ProgrammableTransactionBuilder::new();
@@ -493,6 +577,8 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
                 )
                 .await
                 .unwrap();
+
+            println!("{}", transaction_response.digest);
 
             let object_changes = transaction_response.object_changes.unwrap();
 
@@ -657,11 +743,38 @@ async fn get_verified_effects_and_events(
 }
 
 async fn get_verified_object(config: &Config, id: ObjectID) -> anyhow::Result<Object> {
-    let client: Client = Client::new(config.sui_rest_url());
-    let object = client.get_object(id).await?;
+    let sui_client: Arc<sui_sdk::SuiClient> = Arc::new(
+        SuiClientBuilder::default()
+            .build(config.sui_full_node_url.as_str())
+            .await
+            .unwrap(),
+    );
+
+    // info!("Getting object: {}", id);
+
+    let read_api = sui_client.read_api();
+    let object_json = read_api
+        .get_object_with_options(id, SuiObjectDataOptions::bcs_lossless())
+        .await?;
+    let object = object_json
+        .into_object()
+        .expect("Cannot make into object data");
+    let object: Object = object.try_into().expect("Cannot reconstruct object");
+
+    // Need to authenticate this object
+    let (effects, _) = get_verified_effects_and_events(config, object.previous_transaction).await?;
+
+    // check that this object ID, version and hash is in the effects
+    let target_object_ref = object.compute_object_reference();
+    effects
+        .all_changed_objects()
+        .iter()
+        .find(|object_ref| object_ref.0 == target_object_ref)
+        .ok_or(anyhow!("Object not found"))?;
 
     Ok(object)
 }
+
 
 async fn retrieve_highest_epoch(config: &Config) -> anyhow::Result<u64> {
     let client = SuiClientBuilder::default()
@@ -687,6 +800,7 @@ async fn retrieve_highest_epoch(config: &Config) -> anyhow::Result<u64> {
         .data
         .iter()
         .filter(|event| event.parsed_json.get("epoch").is_some())
+        .filter(|event| event.parsed_json.get("registry_id").unwrap().as_str().unwrap() == config.dwltn_registry_object_id)
         .map(|event| {
             u64::from_str(event.parsed_json.get("epoch").unwrap().as_str().unwrap()).unwrap()
         })
@@ -901,6 +1015,127 @@ async fn remote_fetch_checkpoint(
     }
 }
 
+
+
+pub async fn reserve_gas_inner(
+    client: &RClient,
+    req: ReserveGasRequest,
+) -> Result<ReserveGasResponse> {
+    let server_url = env::var("DWALLET_GAS_STATION_URL")?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        format!("Bearer {}", env::var("GAS_STATION_AUTH")?).parse().unwrap(),
+    );
+    headers.insert("Content-Type", "application/json".parse().unwrap());
+
+    let response = client
+        .post(format!("{}/v1/reserve_gas", server_url))
+        .headers(headers)
+        .json(&req)
+        .send()
+        .await?;
+
+    let response_body = response.json::<ReserveGasResponse>().await?;
+
+    Ok(response_body)
+}
+
+
+pub async fn execute_tx_inner(
+    client: &RClient,
+    req: ExecuteTxRequest,
+) -> Result<ExecuteTxResponse> {
+    let server_url = env::var("DWALLET_GAS_STATION_URL")?;
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        AUTHORIZATION,
+        format!("Bearer {}", env::var("GAS_STATION_AUTH")?).parse().unwrap(),
+    );
+    headers.insert("Content-Type", "application/json".parse().unwrap());
+
+    let response = client
+        .post(format!("{}/v1/execute_tx", server_url))
+        .headers(headers)
+        .json(&req)
+        .send()
+        .await?;
+
+    let response_body = response.json::<ExecuteTxResponse>().await?;
+
+    Ok(response_body)
+}
+
+
+pub async fn execute_transaction(
+    keystore: &FileBasedKeystore,
+    client: &RClient,
+    gas_client: &SuiClient,
+    gas_budget: u64,
+    transaction_kind: TransactionKind,  // Pass the finished transaction here
+) -> Result<()> {
+
+    let gas_budget = 50_000_000;
+    // Reserve gas
+    let reserve_gas_request = ReserveGasRequest {
+        gas_budget,
+        reserve_duration_secs: 20, // Set this based on your logic
+    };
+
+    let reservation_response = reserve_gas_inner(client, reserve_gas_request).await?;
+    let reservation = reservation_response.result.expect("Gas reservation failed");
+
+
+    let gas_price = gas_client
+                    .read_api()
+                    .get_reference_gas_price()
+                    .await?;
+
+    // Build the transaction data
+    let tx_data = TransactionData::new_with_gas_coins_allow_sponsor(
+        transaction_kind,
+        SuiAddress::from_str("")?, // TODO
+        reservation.gas_coins,
+        gas_budget,
+        gas_price,
+        reservation.sponsor_address,
+    );
+
+
+    // Create the intent message and sign it
+    let intent_msg = IntentMessage::new(Intent::sui_transaction(), &tx_data);
+    
+    let user_sig = keystore.sign_secure(keystore.addresses().first().unwrap(), &tx_data, Intent::sui_transaction()).unwrap();
+    // let user_sig = Signature::new_secure(&intent_msg, &keystore).into();
+
+    // Execute the transaction
+    let execute_tx_request = ExecuteTxRequest {
+        reservation_id: reservation.reservation_id,
+        tx_bytes: Base64::from_bytes(&bcs::to_bytes(&tx_data).unwrap()),
+        user_sig: Base64::from_bytes(user_sig.as_ref()),
+    };
+
+    let execute_response = execute_tx_inner(client, execute_tx_request).await?;
+    let result = execute_response.response.expect("Transaction execution failed");
+
+    // Check if the transaction was successful
+    if result
+        .status_ok().unwrap()
+    {
+        // Handle the error if needed
+        // return Err(anyhow!("Transaction failed"));
+        println!("Transaction successful");
+    }
+
+    println!("Transaction failed");
+    Ok(())
+}
+
+
+
+
 #[tokio::main]
 pub async fn main() {
     // Command line arguments and config loading
@@ -920,7 +1155,7 @@ pub async fn main() {
     );
 
     let sui_client: Client = Client::new(config.sui_rest_url());
-    let remote_package_store = RemotePackageStore::new(sui_client, config.clone());
+    let remote_package_store = RemotePackageStore::new(config.clone());
     let resolver = Resolver::new(remote_package_store);
 
     let dwallet_client = SuiClientBuilder::default()
@@ -1282,56 +1517,23 @@ pub async fn main() {
 
             ptb.command(Command::MoveCall(Box::new(call)));
 
-            let builder = ptb.finish();
+            // let builder = ptb.finish();
 
-            let gas_budget = 100_000_000;
-            let gas_price = dwallet_client
-                .read_api()
-                .get_reference_gas_price()
-                .await
-                .unwrap();
+
+            
+            // let gas_client = dwallet_gas_pool::rpc::client::GasPoolRpcClient::new(dwallet_gas_url);
+            // let reservation = gas_client.reserve_gas(gas_budget, 20).await?;
+
 
             let keystore =
                 FileBasedKeystore::new(&sui_config_dir().unwrap().join(SUI_KEYSTORE_FILENAME))
                     .unwrap();
 
-            let sender = *keystore.addresses_with_alias().first().unwrap().0;
+            
+            // create a new requwest client
+            let client = reqwest::Client::new();
 
-            let coins = dwallet_client
-                .coin_read_api()
-                .get_coins(sender, None, None, None)
-                .await
-                .unwrap();
-            let coin_gas = coins
-                .data
-                .into_iter()
-                .max_by_key(|coin| coin.balance)
-                .unwrap();
-        
-            let tx_data = TransactionData::new_programmable(
-                sender,
-                vec![coin_gas.object_ref()],
-                builder,
-                gas_budget,
-                gas_price,
-            );
-
-            // 4) sign transaction
-            let signature = keystore
-                .sign_secure(&sender, &tx_data, Intent::sui_transaction())
-                .unwrap();
-
-            // 5) execute the transaction
-            println!("Submitting the state proof...");
-            let transaction_response = dwallet_client
-                .quorum_driver_api()
-                .execute_transaction_block(
-                    Transaction::from_data(tx_data, vec![signature]),
-                    SuiTransactionBlockResponseOptions::full_content(),
-                    Some(ExecuteTransactionRequestType::WaitForLocalExecution),
-                )
-                .await
-                .unwrap();
+            execute_transaction(&keystore, &client, &sui_client, 50_000_000, TransactionKind::ProgrammableTransaction(ptb.finish())).await.unwrap();
         }
         _ => {}
     }
