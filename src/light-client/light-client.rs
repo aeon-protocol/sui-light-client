@@ -407,6 +407,8 @@ async fn sync_checkpoint_list_to_latest(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+
+
 async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
     println!("Syncing checkpoints to latest");
     sync_checkpoint_list_to_latest(config)
@@ -456,12 +458,6 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
 
         summary.clone().try_into_verified(&prev_committee)?;
         println!("verified checkpoint");
-
-        println!(
-            "Verifying to submit. Last: {} Epoch curr: {}",
-            latest_registered_epoch_committee_id,
-            summary.epoch()
-        );
 
         // Check if the checkpoint needs to be submitted to the dwallet network
         if (latest_registered_epoch_committee_id < summary.epoch()) {
@@ -551,7 +547,11 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
                 .get_coins(sender, None, None, None)
                 .await
                 .unwrap();
-            let coin_gas = coins.data.into_iter().next().unwrap();
+            let coin_gas = coins
+                .data
+                .into_iter()
+                .max_by_key(|coin| coin.balance)
+                .unwrap();
 
             let tx_data = TransactionData::new_programmable(
                 sender,
@@ -577,8 +577,6 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
                 )
                 .await
                 .unwrap();
-
-            println!("{}", transaction_response.digest);
 
             let object_changes = transaction_response.object_changes.unwrap();
 
@@ -630,6 +628,7 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
 
     Ok(())
 }
+
 
 async fn get_full_checkpoint(seq: u64) -> anyhow::Result<CheckpointData> {
     let remote_store_url = format!("https://checkpoints.{}.sui.io", "testnet");
@@ -800,7 +799,7 @@ async fn retrieve_highest_epoch(config: &Config) -> anyhow::Result<u64> {
         .data
         .iter()
         .filter(|event| event.parsed_json.get("epoch").is_some())
-        .filter(|event| event.parsed_json.get("registry_id").unwrap().as_str().unwrap() == config.dwltn_registry_object_id)
+        // .filter(|event| event.parsed_json.get("registry_id").unwrap().as_str().unwrap() == config.dwltn_registry_object_id)
         .map(|event| {
             u64::from_str(event.parsed_json.get("epoch").unwrap().as_str().unwrap()).unwrap()
         })
@@ -1017,121 +1016,120 @@ async fn remote_fetch_checkpoint(
 
 
 
-pub async fn reserve_gas_inner(
-    client: &RClient,
-    req: ReserveGasRequest,
-) -> Result<ReserveGasResponse> {
-    let server_url = env::var("DWALLET_GAS_STATION_URL")?;
+// pub async fn reserve_gas_inner(
+//     client: &RClient,
+//     req: ReserveGasRequest,
+// ) -> Result<ReserveGasResponse> {
+//     let server_url = env::var("DWALLET_GAS_STATION_URL")?;
 
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        format!("Bearer {}", env::var("GAS_STATION_AUTH")?).parse().unwrap(),
-    );
-    headers.insert("Content-Type", "application/json".parse().unwrap());
+//     let mut headers = HeaderMap::new();
+//     headers.insert(
+//         AUTHORIZATION,
+//         format!("Bearer {}", env::var("GAS_STATION_AUTH")?).parse().unwrap(),
+//     );
+//     headers.insert("Content-Type", "application/json".parse().unwrap());
 
-    let response = client
-        .post(format!("{}/v1/reserve_gas", server_url))
-        .headers(headers)
-        .json(&req)
-        .send()
-        .await?;
+//     let response = client
+//         .post(format!("http://{}/v1/reserve_gas", server_url))
+//         .headers(headers)
+//         .json(&req)
+//         .send()
+//         .await?;
+//     println!("Response: {:?}", response);
+//     let response_body = response.json::<ReserveGasResponse>().await?;
 
-    let response_body = response.json::<ReserveGasResponse>().await?;
-
-    Ok(response_body)
-}
-
-
-pub async fn execute_tx_inner(
-    client: &RClient,
-    req: ExecuteTxRequest,
-) -> Result<ExecuteTxResponse> {
-    let server_url = env::var("DWALLET_GAS_STATION_URL")?;
-
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        AUTHORIZATION,
-        format!("Bearer {}", env::var("GAS_STATION_AUTH")?).parse().unwrap(),
-    );
-    headers.insert("Content-Type", "application/json".parse().unwrap());
-
-    let response = client
-        .post(format!("{}/v1/execute_tx", server_url))
-        .headers(headers)
-        .json(&req)
-        .send()
-        .await?;
-
-    let response_body = response.json::<ExecuteTxResponse>().await?;
-
-    Ok(response_body)
-}
+//     Ok(response_body)
+// }
 
 
-pub async fn execute_transaction(
-    keystore: &FileBasedKeystore,
-    client: &RClient,
-    gas_client: &SuiClient,
-    gas_budget: u64,
-    transaction_kind: TransactionKind,  // Pass the finished transaction here
-) -> Result<()> {
+// pub async fn execute_tx_inner(
+//     client: &RClient,
+//     req: ExecuteTxRequest,
+// ) -> Result<ExecuteTxResponse> {
+//     let server_url = env::var("DWALLET_GAS_STATION_URL")?;
 
-    let gas_budget = 50_000_000;
-    // Reserve gas
-    let reserve_gas_request = ReserveGasRequest {
-        gas_budget,
-        reserve_duration_secs: 20, // Set this based on your logic
-    };
+//     let mut headers = HeaderMap::new();
+//     headers.insert(
+//         AUTHORIZATION,
+//         format!("Bearer {}", env::var("GAS_STATION_AUTH")?).parse().unwrap(),
+//     );
+//     headers.insert("Content-Type", "application/json".parse().unwrap());
 
-    let reservation_response = reserve_gas_inner(client, reserve_gas_request).await?;
-    let reservation = reservation_response.result.expect("Gas reservation failed");
+//     let response = client
+//         .post(format!("{}/v1/execute_tx", server_url))
+//         .headers(headers)
+//         .json(&req)
+//         .send()
+//         .await?;
 
+//     let response_body = response.json::<ExecuteTxResponse>().await?;
 
-    let gas_price = gas_client
-                    .read_api()
-                    .get_reference_gas_price()
-                    .await?;
-
-    // Build the transaction data
-    let tx_data = TransactionData::new_with_gas_coins_allow_sponsor(
-        transaction_kind,
-        SuiAddress::from_str("")?, // TODO
-        reservation.gas_coins,
-        gas_budget,
-        gas_price,
-        reservation.sponsor_address,
-    );
+//     Ok(response_body)
+// }
 
 
-    // Create the intent message and sign it
-    let intent_msg = IntentMessage::new(Intent::sui_transaction(), &tx_data);
+// pub async fn execute_transaction(
+//     keystore: &FileBasedKeystore,
+//     client: &RClient,
+//     gas_client: &SuiClient,
+//     gas_budget: u64,
+//     transaction_kind: TransactionKind,  // Pass the finished transaction here
+// ) -> Result<()> {
+
+//     // Reserve gas
+//     let reserve_gas_request = ReserveGasRequest {
+//         gas_budget,
+//         reserve_duration_secs: 20, // Set this based on your logic
+//     };
+
+//     let reservation_response = reserve_gas_inner(client, reserve_gas_request).await?;
+//     let reservation = reservation_response.result.expect("Gas reservation failed");
+
+
+//     let gas_price = gas_client
+//                     .read_api()
+//                     .get_reference_gas_price()
+//                     .await?;
+
+//     // Build the transaction data
+//     let tx_data = TransactionData::new_with_gas_coins_allow_sponsor(
+//         transaction_kind,
+//         SuiAddress::from_str("")?, // TODO
+//         reservation.gas_coins,
+//         gas_budget,
+//         gas_price,
+//         reservation.sponsor_address,
+//     );
+
+
+//     // Create the intent message and sign it
+//     let intent_msg = IntentMessage::new(Intent::sui_transaction(), &tx_data);
     
-    let user_sig = keystore.sign_secure(keystore.addresses().first().unwrap(), &tx_data, Intent::sui_transaction()).unwrap();
-    // let user_sig = Signature::new_secure(&intent_msg, &keystore).into();
+//     let user_sig = keystore.sign_secure(keystore.addresses().first().unwrap(), &tx_data, Intent::sui_transaction()).unwrap();
+//     // let user_sig = Signature::new_secure(&intent_msg, &keystore).into();
 
-    // Execute the transaction
-    let execute_tx_request = ExecuteTxRequest {
-        reservation_id: reservation.reservation_id,
-        tx_bytes: Base64::from_bytes(&bcs::to_bytes(&tx_data).unwrap()),
-        user_sig: Base64::from_bytes(user_sig.as_ref()),
-    };
+//     // Execute the transaction
+//     let execute_tx_request = ExecuteTxRequest {
+//         reservation_id: reservation.reservation_id,
+//         tx_bytes: Base64::from_bytes(&bcs::to_bytes(&tx_data).unwrap()),
+//         user_sig: Base64::from_bytes(user_sig.as_ref()),
+//     };
 
-    let execute_response = execute_tx_inner(client, execute_tx_request).await?;
-    let result = execute_response.response.expect("Transaction execution failed");
+//     let execute_response = execute_tx_inner(client, execute_tx_request).await?;
+//     let result = execute_response.response.expect("Transaction execution failed");
 
-    // Check if the transaction was successful
-    if result
-        .status_ok().unwrap()
-    {
-        // Handle the error if needed
-        // return Err(anyhow!("Transaction failed"));
-        println!("Transaction successful");
-    }
+//     // Check if the transaction was successful
+//     if result
+//         .status_ok().unwrap()
+//     {
+//         // Handle the error if needed
+//         // return Err(anyhow!("Transaction failed"));
+//         println!("Transaction successful");
+//     }
 
-    println!("Transaction failed");
-    Ok(())
-}
+//     println!("Transaction failed");
+//     Ok(())
+// }
 
 
 
@@ -1517,23 +1515,58 @@ pub async fn main() {
 
             ptb.command(Command::MoveCall(Box::new(call)));
 
-            // let builder = ptb.finish();
+            let builder = ptb.finish();
 
-
-            
-            // let gas_client = dwallet_gas_pool::rpc::client::GasPoolRpcClient::new(dwallet_gas_url);
-            // let reservation = gas_client.reserve_gas(gas_budget, 20).await?;
-
+            let gas_budget = 100_000_000;
+            let gas_price = dwallet_client
+                .read_api()
+                .get_reference_gas_price()
+                .await
+                .unwrap();
 
             let keystore =
                 FileBasedKeystore::new(&sui_config_dir().unwrap().join(SUI_KEYSTORE_FILENAME))
                     .unwrap();
 
-            
-            // create a new requwest client
-            let client = reqwest::Client::new();
+            let sender = *keystore.addresses_with_alias().first().unwrap().0;
 
-            execute_transaction(&keystore, &client, &sui_client, 50_000_000, TransactionKind::ProgrammableTransaction(ptb.finish())).await.unwrap();
+            let coins = dwallet_client
+                .coin_read_api()
+                .get_coins(sender, None, None, None)
+                .await
+                .unwrap();
+            let coin_gas = coins
+                .data
+                .into_iter()
+                .max_by_key(|coin| coin.balance)
+                .unwrap();
+        
+            let tx_data = TransactionData::new_programmable(
+                sender,
+                vec![coin_gas.object_ref()],
+                builder,
+                gas_budget,
+                gas_price,
+            );
+
+            // 4) sign transaction
+            let signature = keystore
+                .sign_secure(&sender, &tx_data, Intent::sui_transaction())
+                .unwrap();
+
+            // 5) execute the transaction
+            println!("Submitting the state proof...");
+            let transaction_response = dwallet_client
+                .quorum_driver_api()
+                .execute_transaction_block(
+                    Transaction::from_data(tx_data, vec![signature]),
+                    SuiTransactionBlockResponseOptions::full_content(),
+                    Some(ExecuteTransactionRequestType::WaitForLocalExecution),
+                )
+                .await
+                .unwrap();
+
+            // execute_transaction(&keystore, &client, &sui_client, 500000, TransactionKind::ProgrammableTransaction(ptb.finish())).await.unwrap();
         }
         _ => {}
     }
