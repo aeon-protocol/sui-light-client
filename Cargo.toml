@@ -31,6 +31,8 @@ shared-crypto = { git = "https://github.com/MystenLabs/sui", package = "shared-c
 move-binary-format = { git = "https://github.com/MystenLabs/sui", package = "move-binary-format",rev="c79f53f" }
 sui-json-rpc-types = { git = "https://github.com/MystenLabs/sui", package = "sui-json-rpc-types",rev="c79f53f" }
 sui-package-resolver = { git = "https://github.com/MystenLabs/sui", package = "sui-package-resolver",rev="c79f53f" }
+reqwest = { version = "0.12.7", features = ["json"] }
+fastcrypto = "0.1.8"
 
 
 axum = { version = "0.6.6", default-features = false, features = [
@@ -60,7 +62,6 @@ tracing = "0.1.37"
 object_store = { version = "0.10", features = ["aws", "gcp", "azure", "http"] }
 sui-data-ingestion-core = { git = "https://github.com/MystenLabs/sui", package = "sui-data-ingestion-core",rev="c79f53f" }
 backoff = { version = "0.4.0", features = ["tokio"] }
-
 sui-storage = { git = "https://github.com/MystenLabs/sui", package = "sui-storage",rev="c79f53f"}
 
 
@@ -71,3 +72,7 @@ path = "src/light-client/light-client.rs"
 [[bin]]
 name = "light-client-service"
 path = "src/service/service.rs"
+
+reqwest = { version = "0.11", features = ["json"] }
+fastcrypto = "0.1.0"
+
