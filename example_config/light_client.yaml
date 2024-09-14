@@ -1,7 +1,7 @@
 ---
 sui_full_node_url: "https://fullnode.testnet.sui.io:443"
 dwallet_full_node_url: "https://fullnode.alpha.testnet.dwallet.cloud:443"
-checkpoint_summary_dir: example_config
+checkpoint_summary_dir: usr/local/bin/example_config/
 genesis_filename: genesis_testnet.blob
 object_store_url: "https://checkpoints.testnet.sui.io"
 graphql_url: "https://sui-testnet.mystenlabs.com/graphql"
