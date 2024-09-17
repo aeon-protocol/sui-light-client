@@ -84,6 +84,12 @@ use sui_types::transaction::{TransactionKind};
 use std::{collections::HashMap, sync::Mutex};
 // use log::info;
 
+use log::info;
+use object_store::parse_url;
+// use object_store::path::Path;
+use serde_json::json;
+// use serde_json::Value;
+use url::Url;
 
 
 
@@ -123,9 +129,9 @@ impl PackageStore for RemotePackageStore {
             return Ok(package.clone());
         }
 
-        // info!("Fetch Package: {}", id);
+        info!("Fetch Package: {}", id);
 
-        let object = get_verified_object(&self.config, id.into()).await.unwrap();
+        let object: Object = get_verified_object(&self.config, id.into()).await.unwrap();
         let package = Arc::new(Package::read_from_object(&object).unwrap());
 
         // Add to the cache
@@ -317,12 +323,50 @@ fn write_checkpoint_list(
 
 async fn download_checkpoint_summary(
     config: &Config,
-    seq: u64,
+    checkpoint_number: u64,
 ) -> anyhow::Result<CertifiedCheckpointSummary> {
-    get_full_checkpoint(seq)
-        .await
-        .map(|full_checkpoint| full_checkpoint.checkpoint_summary)
+    // Download the checkpoint from the server
+
+    let url = Url::parse(&config.object_store_url)?;
+    let (dyn_store, _store_path) = parse_url(&url).unwrap();
+    let path = Path::from(format!("{}.chk", checkpoint_number));
+    let response = dyn_store.get(&path).await?;
+    let bytes = response.bytes().await?;
+    let (_, blob) = bcs::from_bytes::<(u8, CheckpointData)>(&bytes)?;
+
+    info!("Downloaded checkpoint summary: {}", checkpoint_number);
+    Ok(blob.checkpoint_summary)
 }
+
+async fn query_last_checkpoint_of_epoch(config: &Config, epoch_id: u64) -> anyhow::Result<u64> {
+    // GraphQL query to get the last checkpoint of an epoch
+    let query = json!({
+        "query": "query ($epochID: Int) { epoch(id: $epochID) { checkpoints(last: 1) { nodes { sequenceNumber } } } }",
+        "variables": { "epochID": epoch_id }
+    });
+
+    // Submit the query by POSTing to the GraphQL endpoint
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(&config.graphql_url)
+        .header("Content-Type", "application/json")
+        .body(query.to_string())
+        .send()
+        .await
+        .expect("Cannot connect to graphql")
+        .text()
+        .await
+        .expect("Cannot parse response");
+
+    // Parse the JSON response to get the last checkpoint of the epoch
+    let v: Value = serde_json::from_str(resp.as_str()).expect("Incorrect JSON response");
+    let checkpoint_number = v["data"]["epoch"]["checkpoints"]["nodes"][0]["sequenceNumber"]
+        .as_u64()
+        .unwrap();
+
+    Ok(checkpoint_number)
+}
+
 
 /// Run binary search to for each end of epoch checkpoint that is missing
 /// between the latest on the list and the latest checkpoint.
@@ -345,63 +389,36 @@ async fn sync_checkpoint_list_to_latest(config: &Config) -> anyhow::Result<()> {
     // Download the very latest checkpoint
     // let client = Client::new(config.sui_rest_url());
     let sui_client = SuiClientBuilder::default()
-        .build(config.sui_full_node_url.clone())
+        .build(config.sui_full_node_url.as_str())
         .await
-        .unwrap();
+        .expect("Cannot connect to full node");
+
     let latest_seq = sui_client
         .read_api()
         .get_latest_checkpoint_sequence_number()
         .await
         .unwrap();
-    let latest = get_full_checkpoint(latest_seq).await?.checkpoint_summary;
-
-    // Binary search to find missing checkpoints
+    let latest = download_checkpoint_summary(config, latest_seq).await?;
+    println!("Latest: {}", latest.epoch());
+    // Sequentially record all the missing end of epoch checkpoints numbers
     while last_epoch + 1 < latest.epoch() {
-        // TOOD change back
-        let mut start = last_checkpoint_seq;
-        let mut end = latest.sequence_number;
-
         let target_epoch = last_epoch + 1;
-        // Print target
-        println!("Target Epoch: {}", target_epoch);
-        let mut found_summary = None;
+        let target_last_checkpoint_number =
+            query_last_checkpoint_of_epoch(config, target_epoch).await?;
 
-        while start < end {
-            let mid = (start + end) / 2;
-            let summary = download_checkpoint_summary(config, mid).await?;
+        // Add to the list
+        checkpoints_list
+            .checkpoints
+            .push(target_last_checkpoint_number);
+        write_checkpoint_list(config, &checkpoints_list)?;
 
-            // print summary epoch and seq
-            println!(
-                "Epoch: {} Seq: {}: {}",
-                summary.epoch(),
-                summary.sequence_number,
-                summary.end_of_epoch_data.is_some()
-            );
+        // Update
+        last_epoch = target_epoch;
 
-            if summary.epoch() == target_epoch && summary.end_of_epoch_data.is_some() {
-                found_summary = Some(summary);
-                break;
-            }
-
-            if summary.epoch() <= target_epoch {
-                start = mid + 1;
-            } else {
-                end = mid;
-            }
-        }
-
-        if let Some(summary) = found_summary {
-            // Note: Do not write summary to file, since we must only persist
-            //       checkpoints that have been verified by the previous committee
-
-            // Add to the list
-            checkpoints_list.checkpoints.push(summary.sequence_number);
-            write_checkpoint_list(config, &checkpoints_list)?;
-
-            // Update
-            last_epoch = summary.epoch();
-            last_checkpoint_seq = summary.sequence_number;
-        }
+        println!(
+            "Last Epoch: {} Last Checkpoint: {}",
+            target_epoch, target_last_checkpoint_number
+        );
     }
 
     Ok(())
@@ -630,15 +647,35 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
 }
 
 
-async fn get_full_checkpoint(seq: u64) -> anyhow::Result<CheckpointData> {
-    let remote_store_url = format!("https://checkpoints.{}.sui.io", "testnet");
-    let object_store = create_remote_store_client(remote_store_url, vec![], 20)
-        .expect("failed to create remote store client");
+// async fn get_full_checkpoint(seq: u64) -> anyhow::Result<CheckpointData> {
+//     let remote_store_url = format!("https://checkpoints.{}.sui.io", "testnet");
+//     let object_store = create_remote_store_client(remote_store_url, vec![], 20)
+//         .expect("failed to create remote store client");
 
-    let (full_checkpoint, _) = remote_fetch_checkpoint(object_store, seq).await?;
+//     let (full_checkpoint, _) = remote_fetch_checkpoint(object_store, seq).await?;
 
+//     Ok(full_checkpoint)
+// }
+
+async fn get_full_checkpoint(
+    config: &Config,
+    checkpoint_number: u64,
+) -> anyhow::Result<CheckpointData> {
+    let url = Url::parse(&config.object_store_url)
+        .map_err(|_| anyhow!("Cannot parse object store URL"))?;
+    let (dyn_store, _store_path) = parse_url(&url).unwrap();
+    let path = Path::from(format!("{}.chk", checkpoint_number));
+    println!("Request full checkpoint: {}", path);
+    let response = dyn_store
+        .get(&path)
+        .await
+        .map_err(|_| anyhow!("Cannot get full checkpoint from object store"))?;
+    let bytes = response.bytes().await?;
+    let (_, full_checkpoint) = bcs::from_bytes::<(u8, CheckpointData)>(&bytes)?;
     Ok(full_checkpoint)
 }
+
+
 
 fn extract_verified_effects_and_events(
     checkpoint: &CheckpointData,
@@ -674,28 +711,31 @@ fn extract_verified_effects_and_events(
     Ok((matching_tx.effects.clone(), matching_tx.events.clone()))
 }
 
+
 async fn get_verified_effects_and_events(
     config: &Config,
     tid: TransactionDigest,
 ) -> anyhow::Result<(TransactionEffects, Option<TransactionEvents>)> {
-    let sui_mainnet: Arc<sui_sdk::SuiClient> = Arc::new(
-        SuiClientBuilder::default()
-            .build(config.sui_full_node_url.as_str())
-            .await
-            .unwrap(),
-    );
+    let sui_mainnet: sui_sdk::SuiClient = SuiClientBuilder::default()
+        .build(config.sui_full_node_url.as_str())
+        .await
+        .unwrap();
     let read_api = sui_mainnet.read_api();
 
+    println!("Getting effects and events for TID: {}", tid);
     // Lookup the transaction id and get the checkpoint sequence number
     let options = SuiTransactionBlockResponseOptions::new();
     let seq = read_api
         .get_transaction_with_options(tid, options)
-        .await?
+        .await
+        .map_err(|e| anyhow!(format!("Cannot get transaction: {e}")))?
         .checkpoint
         .ok_or(anyhow!("Transaction not found"))?;
 
     // Download the full checkpoint for this sequence number
-    let full_check_point = get_full_checkpoint(seq).await?;
+    let full_check_point = get_full_checkpoint(config, seq)
+        .await
+        .map_err(|e| anyhow!(format!("Cannot get full checkpoint: {e}")))?;
 
     // Load the list of stored checkpoints
     let checkpoints_list: CheckpointsList = read_checkpoint_list(config)?;
@@ -713,7 +753,7 @@ async fn get_verified_effects_and_events(
 
         // Check we have the right checkpoint
         anyhow::ensure!(
-            prev_ckp.epoch().saturating_add(1) == full_check_point.checkpoint_summary.epoch(),
+            prev_ckp.epoch().checked_add(1).unwrap() == full_check_point.checkpoint_summary.epoch(),
             "Checkpoint sequence number does not match. Need to Sync."
         );
 
@@ -730,15 +770,19 @@ async fn get_verified_effects_and_events(
             .collect();
 
         // Make a committee object using this
-        Committee::new(prev_ckp.epoch().saturating_add(1), current_committee)
+        Committee::new(prev_ckp.epoch().checked_add(1).unwrap(), current_committee)
     } else {
         // Since we did not find a small committee checkpoint we use the genesis
         let mut genesis_path = config.checkpoint_summary_dir.clone();
         genesis_path.push(&config.genesis_filename);
-        Genesis::load(&genesis_path)?.committee()?
+        Genesis::load(&genesis_path)?
+            .committee()
+            .map_err(|e| anyhow!(format!("Cannot load Genesis: {e}")))?
     };
 
+    info!("Extracting effects and events for TID: {}", tid);
     extract_verified_effects_and_events(&full_check_point, &committee, tid)
+        .map_err(|e| anyhow!(format!("Cannot extract effects and events: {e}")))
 }
 
 async fn get_verified_object(config: &Config, id: ObjectID) -> anyhow::Result<Object> {
@@ -749,27 +793,31 @@ async fn get_verified_object(config: &Config, id: ObjectID) -> anyhow::Result<Ob
             .unwrap(),
     );
 
-    // info!("Getting object: {}", id);
+    println!("Getting object: {}", id);
 
     let read_api = sui_client.read_api();
     let object_json = read_api
         .get_object_with_options(id, SuiObjectDataOptions::bcs_lossless())
-        .await?;
+        .await
+        .expect("Cannot get object");
     let object = object_json
         .into_object()
         .expect("Cannot make into object data");
     let object: Object = object.try_into().expect("Cannot reconstruct object");
 
     // Need to authenticate this object
-    let (effects, _) = get_verified_effects_and_events(config, object.previous_transaction).await?;
+    // let (effects, _) = get_verified_effects_and_events(config, object.previous_transaction)
+    //     .await
+    //     .expect("Cannot get effects and events");
 
-    // check that this object ID, version and hash is in the effects
-    let target_object_ref = object.compute_object_reference();
-    effects
-        .all_changed_objects()
-        .iter()
-        .find(|object_ref| object_ref.0 == target_object_ref)
-        .ok_or(anyhow!("Object not found"))?;
+    // // check that this object ID, version and hash is in the effects
+    // let target_object_ref = object.compute_object_reference();
+    // effects
+    //     .all_changed_objects()
+    //     .iter()
+    //     .find(|object_ref| object_ref.0 == target_object_ref)
+    //     .ok_or(anyhow!("Object not found"))
+    //     .expect("Object not found");
 
     Ok(object)
 }
@@ -1146,6 +1194,8 @@ pub async fn main() {
         .unwrap_or_else(|_| panic!("Unable to load config from {}", path.display()));
     let mut config: Config = serde_yaml::from_reader(reader).unwrap();
 
+    println!("Config: {:?}", config);
+
     // Print config parameters
     println!(
         "Checkpoint Dir: {}",
@@ -1214,11 +1264,13 @@ pub async fn main() {
                     .expect("can't create identifier"),
                 type_params: vec![],
             };
+            println!("Init Tag: {}", init_tag);
 
             let init_type_layout = resolver
                 .type_layout(TypeTag::Struct(Box::new(init_tag)))
                 .await
                 .unwrap();
+
             let init_event_type_layout_arg =
                 ptb.pure(bcs::to_bytes(&init_type_layout).unwrap()).unwrap();
 
@@ -1284,7 +1336,7 @@ pub async fn main() {
             let coin_gas = coins
                 .data
                 .into_iter()
-                .next()
+                .max_by_key(|coin| coin.balance)
                 .expect("no gas coins available");
 
             // create the transaction data that will be sent to the network
@@ -1391,182 +1443,182 @@ pub async fn main() {
             }
         }
         Some(SCommands::Transaction { tid }) => {
-            println!("Proving tx locally");
+            // println!("Proving tx locally");
 
-            let tid = TransactionDigest::from_str(&tid).unwrap();
+            // let tid = TransactionDigest::from_str(&tid).unwrap();
 
-            let (effects, events) = get_verified_effects_and_events(&config, tid).await.unwrap();
+            // let (effects, events) = get_verified_effects_and_events(&config, tid).await.unwrap();
 
-            let exec_digests = effects.execution_digests();
-            println!(
-                "Executed TID: {} Effects: {}",
-                exec_digests.transaction, exec_digests.effects
-            );
+            // let exec_digests = effects.execution_digests();
+            // println!(
+            //     "Executed TID: {} Effects: {}",
+            //     exec_digests.transaction, exec_digests.effects
+            // );
 
-            for event in events.as_ref().unwrap().data.iter() {
-                let type_layout = resolver
-                    .type_layout(event.type_.clone().into())
-                    .await
-                    .unwrap();
+            // for event in events.as_ref().unwrap().data.iter() {
+            //     let type_layout = resolver
+            //         .type_layout(event.type_.clone().into())
+            //         .await
+            //         .unwrap();
 
-                let json_val =
-                    SuiJsonValue::from_bcs_bytes(Some(&type_layout), &event.contents).unwrap();
+            //     let json_val =
+            //         SuiJsonValue::from_bcs_bytes(Some(&type_layout), &event.contents).unwrap();
 
-                println!(
-                    "Event:\n - Package: {}\n - Module: {}\n - Sender: {}\n - Type: {}\n{}",
-                    event.package_id,
-                    event.transaction_module,
-                    event.sender,
-                    event.type_,
-                    serde_json::to_string_pretty(&json_val.to_json_value()).unwrap()
-                );
-            }
+            //     println!(
+            //         "Event:\n - Package: {}\n - Module: {}\n - Sender: {}\n - Type: {}\n{}",
+            //         event.package_id,
+            //         event.transaction_module,
+            //         event.sender,
+            //         event.type_,
+            //         serde_json::to_string_pretty(&json_val.to_json_value()).unwrap()
+            //     );
+            // }
 
-            println!("Submitting proof onchain");
+            // println!("Submitting proof onchain");
 
-            let sui_client: Arc<sui_sdk::SuiClient> = Arc::new(
-                SuiClientBuilder::default()
-                    .build(&config.sui_full_node_url.as_str())
-                    .await
-                    .unwrap(),
-            );
-            let options = SuiTransactionBlockResponseOptions::new();
-            let seq = sui_client
-                .read_api()
-                .get_transaction_with_options(tid, options)
-                .await
-                .unwrap()
-                .checkpoint
-                .ok_or(anyhow!("Transaction not found"))
-                .unwrap();
+            // let sui_client: Arc<sui_sdk::SuiClient> = Arc::new(
+            //     SuiClientBuilder::default()
+            //         .build(&config.sui_full_node_url.as_str())
+            //         .await
+            //         .unwrap(),
+            // );
+            // let options = SuiTransactionBlockResponseOptions::new();
+            // let seq = sui_client
+            //     .read_api()
+            //     .get_transaction_with_options(tid, options)
+            //     .await
+            //     .unwrap()
+            //     .checkpoint
+            //     .ok_or(anyhow!("Transaction not found"))
+            //     .unwrap();
 
-            let full_checkpoint = get_full_checkpoint(seq).await.expect("error");
+            // let full_checkpoint = get_full_checkpoint(seq).await.expect("error");
 
-            let ckp_epoch_id = full_checkpoint.checkpoint_summary.data().epoch;
+            // let ckp_epoch_id = full_checkpoint.checkpoint_summary.data().epoch;
 
-            println!("Epoch ID: {}", ckp_epoch_id);
-            println!("Sequence: {}", seq);
+            // println!("Epoch ID: {}", ckp_epoch_id);
+            // println!("Sequence: {}", seq);
 
-            let epoch_committee_id =
-                retieve_epoch_committee_id_by_epoch(&config, ckp_epoch_id.checked_sub(1).unwrap())
-                    .await
-                    .unwrap();
-            let epoch_committee_object_ref = get_object_ref_by_id(&config, epoch_committee_id)
-                .await
-                .unwrap();
-            println!("Epoch Committee ID: {}", epoch_committee_id);
+            // let epoch_committee_id =
+            //     retieve_epoch_committee_id_by_epoch(&config, ckp_epoch_id.checked_sub(1).unwrap())
+            //         .await
+            //         .unwrap();
+            // let epoch_committee_object_ref = get_object_ref_by_id(&config, epoch_committee_id)
+            //     .await
+            //     .unwrap();
+            // println!("Epoch Committee ID: {}", epoch_committee_id);
 
-            let dwallet_cap_object_ref = create_dwallet_cap(&config).await.unwrap();
+            // let dwallet_cap_object_ref = create_dwallet_cap(&config).await.unwrap();
 
-            let (matching_tx, _) = full_checkpoint
-                .transactions
-                .iter()
-                .zip(full_checkpoint.checkpoint_contents.iter())
-                // Note that we get the digest of the effects to ensure this is
-                // indeed the correct effects that are authenticated in the contents.
-                .find(|(tx, digest)| {
-                    tx.effects.execution_digests() == **digest && digest.transaction == tid
-                })
-                .ok_or(anyhow!("Transaction not found in checkpoint contents"))
-                .unwrap();
+            // let (matching_tx, _) = full_checkpoint
+            //     .transactions
+            //     .iter()
+            //     .zip(full_checkpoint.checkpoint_contents.iter())
+            //     // Note that we get the digest of the effects to ensure this is
+            //     // indeed the correct effects that are authenticated in the contents.
+            //     .find(|(tx, digest)| {
+            //         tx.effects.execution_digests() == **digest && digest.transaction == tid
+            //     })
+            //     .ok_or(anyhow!("Transaction not found in checkpoint contents"))
+            //     .unwrap();
 
-            let mut ptb = ProgrammableTransactionBuilder::new();
+            // let mut ptb = ProgrammableTransactionBuilder::new();
 
-            let config_object_ref = get_object_ref_by_id(
-                &config,
-                ObjectID::from_hex_literal(&config.dwltn_config_object_id).unwrap(),
-            )
-            .await
-            .unwrap();
-            let config_arg = ptb
-                .obj(ObjectArg::ImmOrOwnedObject(config_object_ref))
-                .unwrap();
-            let dwallet_cap_arg = ptb
-                .obj(ObjectArg::ImmOrOwnedObject(dwallet_cap_object_ref))
-                .unwrap();
-            let committee_arg = ptb
-                .obj(ObjectArg::ImmOrOwnedObject(epoch_committee_object_ref))
-                .unwrap();
-            let checkpoint_summary_arg = ptb
-                .pure(bcs::to_bytes(&full_checkpoint.checkpoint_summary).unwrap())
-                .unwrap();
-            let checkpoint_contents_arg = ptb
-                .pure(bcs::to_bytes(&full_checkpoint.checkpoint_contents).unwrap())
-                .unwrap();
-            let transaction_arg = ptb.pure(bcs::to_bytes(&matching_tx).unwrap()).unwrap();
+            // let config_object_ref = get_object_ref_by_id(
+            //     &config,
+            //     ObjectID::from_hex_literal(&config.dwltn_config_object_id).unwrap(),
+            // )
+            // .await
+            // .unwrap();
+            // let config_arg = ptb
+            //     .obj(ObjectArg::ImmOrOwnedObject(config_object_ref))
+            //     .unwrap();
+            // let dwallet_cap_arg = ptb
+            //     .obj(ObjectArg::ImmOrOwnedObject(dwallet_cap_object_ref))
+            //     .unwrap();
+            // let committee_arg = ptb
+            //     .obj(ObjectArg::ImmOrOwnedObject(epoch_committee_object_ref))
+            //     .unwrap();
+            // let checkpoint_summary_arg = ptb
+            //     .pure(bcs::to_bytes(&full_checkpoint.checkpoint_summary).unwrap())
+            //     .unwrap();
+            // let checkpoint_contents_arg = ptb
+            //     .pure(bcs::to_bytes(&full_checkpoint.checkpoint_contents).unwrap())
+            //     .unwrap();
+            // let transaction_arg = ptb.pure(bcs::to_bytes(&matching_tx).unwrap()).unwrap();
 
-            let call = ProgrammableMoveCall {
-                package: ObjectID::from_hex_literal(
-                    "0x0000000000000000000000000000000000000000000000000000000000000003",
-                )
-                .unwrap(),
-                module: Identifier::new("sui_state_proof").unwrap(),
-                function: Identifier::new("create_dwallet_wrapper").unwrap(),
-                type_arguments: vec![],
-                arguments: vec![
-                    config_arg,
-                    dwallet_cap_arg,
-                    committee_arg,
-                    checkpoint_summary_arg,
-                    checkpoint_contents_arg,
-                    transaction_arg,
-                ],
-            };
+            // let call = ProgrammableMoveCall {
+            //     package: ObjectID::from_hex_literal(
+            //         "0x0000000000000000000000000000000000000000000000000000000000000003",
+            //     )
+            //     .unwrap(),
+            //     module: Identifier::new("sui_state_proof").unwrap(),
+            //     function: Identifier::new("create_dwallet_wrapper").unwrap(),
+            //     type_arguments: vec![],
+            //     arguments: vec![
+            //         config_arg,
+            //         dwallet_cap_arg,
+            //         committee_arg,
+            //         checkpoint_summary_arg,
+            //         checkpoint_contents_arg,
+            //         transaction_arg,
+            //     ],
+            // };
 
-            ptb.command(Command::MoveCall(Box::new(call)));
+            // ptb.command(Command::MoveCall(Box::new(call)));
 
-            let builder = ptb.finish();
+            // let builder = ptb.finish();
 
-            let gas_budget = 100_000_000;
-            let gas_price = dwallet_client
-                .read_api()
-                .get_reference_gas_price()
-                .await
-                .unwrap();
+            // let gas_budget = 100_000_000;
+            // let gas_price = dwallet_client
+            //     .read_api()
+            //     .get_reference_gas_price()
+            //     .await
+            //     .unwrap();
 
-            let keystore =
-                FileBasedKeystore::new(&sui_config_dir().unwrap().join(SUI_KEYSTORE_FILENAME))
-                    .unwrap();
+            // let keystore =
+            //     FileBasedKeystore::new(&sui_config_dir().unwrap().join(SUI_KEYSTORE_FILENAME))
+            //         .unwrap();
 
-            let sender = *keystore.addresses_with_alias().first().unwrap().0;
+            // let sender = *keystore.addresses_with_alias().first().unwrap().0;
 
-            let coins = dwallet_client
-                .coin_read_api()
-                .get_coins(sender, None, None, None)
-                .await
-                .unwrap();
-            let coin_gas = coins
-                .data
-                .into_iter()
-                .max_by_key(|coin| coin.balance)
-                .unwrap();
+            // let coins = dwallet_client
+            //     .coin_read_api()
+            //     .get_coins(sender, None, None, None)
+            //     .await
+            //     .unwrap();
+            // let coin_gas = coins
+            //     .data
+            //     .into_iter()
+            //     .max_by_key(|coin| coin.balance)
+            //     .unwrap();
         
-            let tx_data = TransactionData::new_programmable(
-                sender,
-                vec![coin_gas.object_ref()],
-                builder,
-                gas_budget,
-                gas_price,
-            );
+            // let tx_data = TransactionData::new_programmable(
+            //     sender,
+            //     vec![coin_gas.object_ref()],
+            //     builder,
+            //     gas_budget,
+            //     gas_price,
+            // );
 
-            // 4) sign transaction
-            let signature = keystore
-                .sign_secure(&sender, &tx_data, Intent::sui_transaction())
-                .unwrap();
+            // // 4) sign transaction
+            // let signature = keystore
+            //     .sign_secure(&sender, &tx_data, Intent::sui_transaction())
+            //     .unwrap();
 
-            // 5) execute the transaction
-            println!("Submitting the state proof...");
-            let transaction_response = dwallet_client
-                .quorum_driver_api()
-                .execute_transaction_block(
-                    Transaction::from_data(tx_data, vec![signature]),
-                    SuiTransactionBlockResponseOptions::full_content(),
-                    Some(ExecuteTransactionRequestType::WaitForLocalExecution),
-                )
-                .await
-                .unwrap();
+            // // 5) execute the transaction
+            // println!("Submitting the state proof...");
+            // let transaction_response = dwallet_client
+            //     .quorum_driver_api()
+            //     .execute_transaction_block(
+            //         Transaction::from_data(tx_data, vec![signature]),
+            //         SuiTransactionBlockResponseOptions::full_content(),
+            //         Some(ExecuteTransactionRequestType::WaitForLocalExecution),
+            //     )
+            //     .await
+            //     .unwrap();
 
-            // execute_transaction(&keystore, &client, &sui_client, 500000, TransactionKind::ProgrammableTransaction(ptb.finish())).await.unwrap();
+            // // execute_transaction(&keystore, &client, &sui_client, 500000, TransactionKind::ProgrammableTransaction(ptb.finish())).await.unwrap();
         }
         _ => {}
     }
