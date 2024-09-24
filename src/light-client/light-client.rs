@@ -542,16 +542,37 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
             let sender = *keystore.addresses_with_alias().first().unwrap().0;
             println!("sender: {}", sender);
 
-            let coins = dwallet_client
-                .coin_read_api()
-                .get_coins(sender, None, None, None)
-                .await
-                .unwrap();
-            let coin_gas = coins
-                .data
-                .into_iter()
-                .max_by_key(|coin| coin.balance)
-                .unwrap();
+            // fetching the coin with the max balance
+            let mut next_cursor = None;
+            let mut max_coin: Option<sui_json_rpc_types::Coin> = None;
+            
+            loop {
+                let coins = dwallet_client
+                    .coin_read_api()
+                    .get_coins(sender, None, next_cursor, None)
+                    .await
+                    .unwrap();
+                
+                // Update max_coin based on current page data
+                if let Some(current_max) = coins.data.into_iter().max_by_key(|coin| coin.balance) {
+                    max_coin = match max_coin {
+                        Some(existing_max) => Some(if existing_max.balance > current_max.balance {
+                            existing_max
+                        } else {
+                            current_max
+                        }),
+                        None => Some(current_max),
+                    };
+                }
+            // Break if there are no more pages            
+                if !coins.has_next_page {
+                    break;
+                }
+                next_cursor = coins.next_cursor;
+            }
+            
+            // max_coin now holds the coin with the max balance across all pages
+            let coin_gas = max_coin.unwrap();
 
             let tx_data = TransactionData::new_programmable(
                 sender,
