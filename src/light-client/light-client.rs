@@ -39,7 +39,7 @@ use sui_config::genesis::Genesis;
 use sui_json::SuiJsonValue;
 use sui_package_resolver::Result as ResolverResult;
 use sui_package_resolver::{Package, PackageStore, Resolver};
-use sui_sdk::{SuiClientBuilder, SuiClient};
+use sui_sdk::{SuiClient, SuiClientBuilder};
 
 use clap::{Parser, Subcommand};
 use std::collections::BTreeMap;
@@ -65,23 +65,23 @@ use sui_sdk::{
 };
 use sui_types::dynamic_field::DynamicFieldName;
 
-use shared_crypto::intent::{IntentMessage};
+use shared_crypto::intent::IntentMessage;
 
-use reqwest::header::{HeaderMap, AUTHORIZATION};
 use fastcrypto::encoding::Base64;
+use reqwest::header::{HeaderMap, AUTHORIZATION};
 // use anyhow::Result;
 // use reqwest::header::{HeaderMap, AUTHORIZATION};
 use reqwest::Client as RClient;
 // use serde::{Deserialize, Serialize};
 use std::env;
 // use sui_types::base_types::{SuiAddress, ObjectRef};
-use sui_types::crypto::{SuiKeyPair, Signature};
+use sui_types::crypto::{Signature, SuiKeyPair};
 // use sui_types::messages::{TransactionData, TransactionKind};
 // use sui_types::intent::{Intent, IntentMessage};
 use sui_json_rpc_types::SuiTransactionBlockResponse;
 
-use sui_types::transaction::{TransactionKind};
 use std::{collections::HashMap, sync::Mutex};
+use sui_types::transaction::TransactionKind;
 
 use log::info;
 use object_store::parse_url;
@@ -89,8 +89,6 @@ use object_store::parse_url;
 use serde_json::json;
 // use serde_json::Value;
 use url::Url;
-
-
 
 /// A light client for the Sui blockchain
 #[derive(Parser, Debug)]
@@ -158,7 +156,6 @@ enum SCommands {
     },
 }
 
-
 // The config file for the light client including the root of trust genesis digest
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
 struct Config {
@@ -196,7 +193,6 @@ impl Config {
     }
 }
 
-
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ReserveGasRequest {
     pub gas_budget: u64,
@@ -211,9 +207,9 @@ pub struct ReserveGasResponse {
 
 #[derive(Serialize, Deserialize, Debug)]
 pub struct ReserveGasResult {
-    pub sponsor_address: SuiAddress,  // Adjust this as per your actual type
-    pub reservation_id: u64,      // Adjust this as per your actual type
-    pub gas_coins: Vec<ObjectRef>, // Adjust this as per your actual type
+    pub sponsor_address: SuiAddress, // Adjust this as per your actual type
+    pub reservation_id: u64,         // Adjust this as per your actual type
+    pub gas_coins: Vec<ObjectRef>,   // Adjust this as per your actual type
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -228,10 +224,6 @@ pub struct ExecuteTxResponse {
     pub response: Option<SuiTransactionBlockResponse>,
     pub error: Option<String>,
 }
-
-
-
-
 
 // The list of checkpoints at the end of each epoch
 #[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
@@ -366,7 +358,6 @@ async fn query_last_checkpoint_of_epoch(config: &Config, epoch_id: u64) -> anyho
     Ok(checkpoint_number)
 }
 
-
 /// Run binary search to for each end of epoch checkpoint that is missing
 /// between the latest on the list and the latest checkpoint.
 async fn sync_checkpoint_list_to_latest(config: &Config) -> anyhow::Result<()> {
@@ -422,8 +413,6 @@ async fn sync_checkpoint_list_to_latest(config: &Config) -> anyhow::Result<()> {
 
     Ok(())
 }
-
-
 
 async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
     println!("Syncing checkpoints to latest");
@@ -645,7 +634,6 @@ async fn check_and_sync_checkpoints(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-
 // async fn get_full_checkpoint(seq: u64) -> anyhow::Result<CheckpointData> {
 //     let remote_store_url = format!("https://checkpoints.{}.sui.io", "testnet");
 //     let object_store = create_remote_store_client(remote_store_url, vec![], 20)
@@ -673,8 +661,6 @@ async fn get_full_checkpoint(
     let (_, full_checkpoint) = bcs::from_bytes::<(u8, CheckpointData)>(&bytes)?;
     Ok(full_checkpoint)
 }
-
-
 
 fn extract_verified_effects_and_events(
     checkpoint: &CheckpointData,
@@ -709,7 +695,6 @@ fn extract_verified_effects_and_events(
     // Since we do not check objects we do not return them
     Ok((matching_tx.effects.clone(), matching_tx.events.clone()))
 }
-
 
 async fn get_verified_effects_and_events(
     config: &Config,
@@ -821,7 +806,6 @@ async fn get_verified_object(config: &Config, id: ObjectID) -> anyhow::Result<Ob
     Ok(object)
 }
 
-
 async fn retrieve_highest_epoch(config: &Config) -> anyhow::Result<u64> {
     let client = SuiClientBuilder::default()
         .build(config.dwallet_full_node_url.clone())
@@ -837,22 +821,35 @@ async fn retrieve_highest_epoch(config: &Config) -> anyhow::Result<u64> {
     };
 
     // TODO only query one
-    let res = client
-        .event_api()
-        .query_events(query.clone(), Option::None, Option::None, true)
-        .await
-        .unwrap();
-    let max = res
-        .data
-        .iter()
-        .filter(|event| event.parsed_json.get("epoch").is_some())
-        .filter(|event| event.parsed_json.get("registry_id").unwrap().as_str().unwrap() == config.dwltn_registry_object_id)
-        .map(|event| {
-            u64::from_str(event.parsed_json.get("epoch").unwrap().as_str().unwrap()).unwrap()
-        })
-        .max()
-        .unwrap();
-    return anyhow::Ok(max);
+    let mut has_next = true;
+    let mut cursor = None;
+    let mut max_epoch = 0;
+
+    while has_next {
+        let res = client
+            .event_api()
+            .query_events(query.clone(), cursor, None, true)
+            .await
+            .unwrap();
+
+        // Update max epoch from current page
+        for event in res.data.iter() {
+            if let Some(epoch_str) = event.parsed_json.get("epoch") {
+                if let Some(registry_id) = event.parsed_json.get("registry_id") {
+                    if registry_id.as_str().unwrap() == config.dwltn_registry_object_id {
+                        if let Ok(epoch) = u64::from_str(epoch_str.as_str().unwrap()) {
+                            max_epoch = max_epoch.max(epoch);
+                        }
+                    }
+                }
+            }
+        }
+
+        cursor = res.next_cursor;
+        has_next = res.has_next_page;
+    }
+    println!("max_epoch: {:?}", max_epoch);
+    return anyhow::Ok(max_epoch);
 }
 
 async fn retieve_epoch_committee_id_by_epoch(
@@ -1061,8 +1058,6 @@ async fn remote_fetch_checkpoint(
     }
 }
 
-
-
 // pub async fn reserve_gas_inner(
 //     client: &RClient,
 //     req: ReserveGasRequest,
@@ -1087,7 +1082,6 @@ async fn remote_fetch_checkpoint(
 
 //     Ok(response_body)
 // }
-
 
 // pub async fn execute_tx_inner(
 //     client: &RClient,
@@ -1114,7 +1108,6 @@ async fn remote_fetch_checkpoint(
 //     Ok(response_body)
 // }
 
-
 // pub async fn execute_transaction(
 //     keystore: &FileBasedKeystore,
 //     client: &RClient,
@@ -1132,7 +1125,6 @@ async fn remote_fetch_checkpoint(
 //     let reservation_response = reserve_gas_inner(client, reserve_gas_request).await?;
 //     let reservation = reservation_response.result.expect("Gas reservation failed");
 
-
 //     let gas_price = gas_client
 //                     .read_api()
 //                     .get_reference_gas_price()
@@ -1148,10 +1140,9 @@ async fn remote_fetch_checkpoint(
 //         reservation.sponsor_address,
 //     );
 
-
 //     // Create the intent message and sign it
 //     let intent_msg = IntentMessage::new(Intent::sui_transaction(), &tx_data);
-    
+
 //     let user_sig = keystore.sign_secure(keystore.addresses().first().unwrap(), &tx_data, Intent::sui_transaction()).unwrap();
 //     // let user_sig = Signature::new_secure(&intent_msg, &keystore).into();
 
@@ -1177,9 +1168,6 @@ async fn remote_fetch_checkpoint(
 //     println!("Transaction failed");
 //     Ok(())
 // }
-
-
-
 
 #[tokio::main]
 pub async fn main() {
@@ -1591,7 +1579,7 @@ pub async fn main() {
             //     .into_iter()
             //     .max_by_key(|coin| coin.balance)
             //     .unwrap();
-        
+
             // let tx_data = TransactionData::new_programmable(
             //     sender,
             //     vec![coin_gas.object_ref()],
